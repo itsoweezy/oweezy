@@ -110,7 +110,6 @@ header a:hover{color:var(--accent);}
     /* ---- Click Hint Styling ---- */
     .click-hint {
         font-size: 0.9rem;
-        color: var(#fff);
         text-align: center;
         margin-top: 0.5rem;
         opacity: 0.8;
@@ -118,8 +117,8 @@ header a:hover{color:var(--accent);}
         cursor: pointer;
         font-family: "Courier New", Courier, monospace;
         text-decoration: none; /* Removes the default underline */
-            color: #fff;           /* Ensures the text stays white */
-        }
+        color: #fff;           /* Ensures the text stays white */
+    }
 
     /* Hide the hint on mobile */
     @media (max-width: 768px) {
@@ -340,21 +339,6 @@ ul{
         .container{
             padding:2rem;
         }
-
-        /* Flatten the file tree on mobile: drop nested indentation and connector lines */
-        .tree ul{
-            margin-left:0;
-        }
-        .tree li{
-            padding-left:1.5rem;
-        }
-        .tree li::before,
-        .tree ul li::before{
-            left:0.2rem;
-        }
-        .tree ul li::after{
-            display:none;
-        }
     }
 </style>
 
@@ -437,7 +421,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // ---- NEW: Handle Internal Tree Shortcuts ----
     document.querySelectorAll('.tree-shortcut').forEach(link => {
         link.addEventListener('click', e => {
-            e.preventDefault(); // Stop page from jumping to top
+            e.preventDefault();  // Stop page from jumping to top
+            e.stopPropagation(); // Stop this click from bubbling up into the
+                                  // enclosing folder's own click handler — that
+                                  // was toggling the enclosing folder shut at
+                                  // the same moment we scroll, which yanked
+                                  // content out from above the scroll target
+                                  // and threw the scroll destination way off.
             
             const targetId = link.getAttribute('data-target');
             const targetEl = document.getElementById(targetId);
@@ -457,8 +447,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 // We simulate a click on the target folder to reuse your existing animation/logic
                 targetEl.click();
                 
-                // 3. Optional: Smooth scroll the target into view
-                targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                // 3. Smooth scroll so the TOP of the section lands near the top of
+                // the viewport, rather than centering the whole (often very tall)
+                // block, which was landing deep inside the content instead of at
+                // its heading.
+                targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
         });
     });
