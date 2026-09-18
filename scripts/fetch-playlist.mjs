@@ -23,11 +23,25 @@
 //   - "added"    -> the first time THIS script saw the track, remembered in
 //                   playlist.json under `seen` (see "First-seen dates")
 //
+// The widget shows the first TRACK_LIMIT (20) tracks in the playlist's own
+// order, plus a "listen to more" link that opens the playlist's first track
+// in Spotify (with the playlist as its context, so it plays on down the list).
+//
+// Covers, albums and Apple Music links are looked up once per track and then
+// reused from the previous playlist.json, so a normal run makes almost no
+// iTunes/oEmbed calls. (Apple asks for ~20 iTunes calls a minute at most.)
+// Anything that failed or fell back to a search link is retried next run.
+//
 // Optional env vars:
 //   SPOTIFY_PLAYLIST_ID     override the playlist
 //   APPLE_MUSIC_PLAYLIST_URL  link for the widget's Apple Music chip
-//   SPOTIFY_TRACK_ORDER     "newest-last" (default; Spotify appends new songs
-//                           to the bottom) or "newest-first"
+//   SPOTIFY_TRACK_ORDER     "playlist" (default): the FIRST TRACK_LIMIT tracks
+//                           in playlist order. "reverse": the LAST TRACK_LIMIT
+//                           tracks, last one first — since Spotify appends new
+//                           songs to the bottom, that's "newest first".
+//   REFRESH_ALL=1           ignore the cache and re-look-up every track
+//                           (use after changing ART_WIDTH or ASCII_RAMP)
+//   ITUNES_GAP_MS           pause between iTunes lookups (default 3100)
 //   DEBUG_EMBED=1           also write embed-debug.json (the raw embed data),
 //                           handy for seeing what changed if parsing breaks
 
@@ -48,16 +62,21 @@ const APPLE_PLAYLIST_URL =
   process.env.APPLE_MUSIC_PLAYLIST_URL ||
   "https://music.apple.com/us/playlist/this-is-owen-lantz/pl.u-BNA6z9jsRNM0DJ1";
 
-const TRACK_ORDER = (process.env.SPOTIFY_TRACK_ORDER || "newest-last").toLowerCase();
+const TRACK_ORDER = (process.env.SPOTIFY_TRACK_ORDER || "playlist").toLowerCase();
 
-const TRACK_LIMIT = 8;      // how many recent additions to render
+const TRACK_LIMIT = 20;     // how many tracks to render
 const ART_WIDTH = 44;       // characters wide
 const CHAR_ASPECT = 0.5;    // monospace chars are ~2x taller than wide
 const APPLE_STOREFRONT = "us";
 
+// Apple documents the iTunes Search API at "approximately 20 calls per minute"
+// (per IP, and GitHub's runners share IPs), so uncached lookups are spaced out.
+const ITUNES_GAP_MS = process.env.ITUNES_GAP_MS ? Number(process.env.ITUNES_GAP_MS) : 3100;
+
 // Embed pages appear to cap how many tracks they list (reports say 50 or 100).
-// If we get exactly one of these back we warn, because a playlist longer than
-// the cap would make "newest-last" show the wrong songs.
+// That only matters in "reverse" order, where we want the END of the playlist:
+// if we get exactly one of these back we warn, because a longer playlist would
+// be cut off and the "newest" songs would be missing.
 const KNOWN_EMBED_CAPS = [50, 100];
 
 // Brightness -> character, light to dense. Dark source pixels map to
@@ -190,6 +209,13 @@ const norm = (s) =>
 
 const overlaps = (a, b) => Boolean(a && b && (a.includes(b) || b.includes(a)));
 
+let lastItunesCall = 0;
+async function throttleItunes() {
+  const wait = lastItunesCall + ITUNES_GAP_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastItunesCall = Date.now();
+}
+
 async function findAppleMusic(trackName, artistName) {
   const term = `${artistName} ${trackName}`;
   const searchUrl = `https://music.apple.com/${APPLE_STOREFRONT}/search?term=${encodeURIComponent(term)}`;
@@ -197,6 +223,7 @@ async function findAppleMusic(trackName, artistName) {
     `https://itunes.apple.com/search?term=${encodeURIComponent(term)}` +
     `&entity=song&limit=5&country=${APPLE_STOREFRONT}`;
 
+  await throttleItunes();
   try {
     const res = await fetchWithTimeout(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -323,6 +350,35 @@ const stripAlbumSuffix = (s) => String(s || "").replace(/ - (Single|EP)$/i, "");
 // Main
 // ---------------------------------------------------------------------------
 
+// Album / year / Apple link / cover art for one track. This is the slow part
+// (three network calls), so main() reuses the previous result when it can.
+async function lookUpExtras(t) {
+  const firstArtist = t.artist.split(",")[0].trim();
+
+  const [apple, spotifyCover] = await Promise.all([
+    findAppleMusic(t.name, firstArtist),
+    findSpotifyCover(t.id),
+  ]);
+
+  // Prefer Spotify's own cover; fall back to iTunes artwork for a confident match.
+  const coverUrl = spotifyCover || hiRes(apple.match?.artworkUrl100) || null;
+  let art = "";
+  if (coverUrl) {
+    try {
+      art = await imageToAscii(coverUrl);
+    } catch (err) {
+      console.warn(`No art for "${t.name}": ${err.message}`);
+    }
+  }
+
+  return {
+    album: stripAlbumSuffix(apple.match?.collectionName),
+    year: (apple.match?.releaseDate || "").slice(0, 4),
+    appleMusicUrl: apple.url,
+    art,
+  };
+}
+
 async function main() {
   const [nextData, previous] = await Promise.all([fetchEmbedData(), readPrevious()]);
 
@@ -333,52 +389,58 @@ async function main() {
 
   const { playlist, tracks: allTracks } = parseEmbed(nextData);
 
-  if (KNOWN_EMBED_CAPS.includes(allTracks.length)) {
+  if (TRACK_ORDER === "reverse" && KNOWN_EMBED_CAPS.includes(allTracks.length)) {
     console.warn(
       `The embed returned exactly ${allTracks.length} tracks, which may be its cap. ` +
-        `If the playlist is longer, "recent additions" could be wrong.`
+        `If the playlist is longer, the newest songs could be missing.`
     );
   }
 
   const nowIso = new Date().toISOString();
   const seen = buildSeenMap(allTracks, previous, nowIso);
 
-  const ordered = TRACK_ORDER === "newest-first" ? allTracks : [...allTracks].reverse();
+  const ordered = TRACK_ORDER === "reverse" ? [...allTracks].reverse() : allTracks;
+
+  // Reuse what we looked up for a track on a previous run, unless that result
+  // is incomplete (no art, or only a search-link fallback) — those are retried.
+  const cache = new Map((previous?.tracks || []).map((t) => [t.id, t]));
+  const isComplete = (p) =>
+    Boolean(p?.art && p.appleMusicUrl && !p.appleMusicUrl.includes("/search?term="));
 
   const tracks = [];
   for (const t of ordered.slice(0, TRACK_LIMIT)) {
-    const firstArtist = t.artist.split(",")[0].trim();
-
-    const [apple, spotifyCover] = await Promise.all([
-      findAppleMusic(t.name, firstArtist),
-      findSpotifyCover(t.id),
-    ]);
-
-    // Prefer Spotify's own cover; fall back to iTunes artwork for a confident match.
-    const coverUrl = spotifyCover || hiRes(apple.match?.artworkUrl100) || null;
-    let art = "";
-    if (coverUrl) {
-      try {
-        art = await imageToAscii(coverUrl);
-      } catch (err) {
-        console.warn(`No art for "${t.name}": ${err.message}`);
-      }
-    }
+    const cached = process.env.REFRESH_ALL ? null : cache.get(t.id);
+    const extras = isComplete(cached)
+      ? {
+          album: cached.album || "",
+          year: cached.year || "",
+          appleMusicUrl: cached.appleMusicUrl,
+          art: cached.art,
+        }
+      : await lookUpExtras(t);
 
     tracks.push({
       id: t.id,
       name: t.name,
       artist: t.artist,
-      album: stripAlbumSuffix(apple.match?.collectionName),
-      year: (apple.match?.releaseDate || "").slice(0, 4),
+      album: extras.album,
+      year: extras.year,
       duration: duration(t.durationMs),
       addedAt: seen[t.id] ?? null,
       timeAgo: timeAgo(seen[t.id]),
       spotifyUrl: `https://open.spotify.com/track/${t.id}`,
-      appleMusicUrl: apple.url,
-      art,
+      appleMusicUrl: extras.appleMusicUrl,
+      art: extras.art,
     });
   }
+
+  // "Click here to listen to more": the playlist's FIRST track, opened with the
+  // playlist as its context so Spotify plays on down the list in order. Spotify
+  // decides whether a link autoplays (see the note in the widget) — of all link
+  // types, track links are the ones it will start playing.
+  const playFirstUrl =
+    `https://open.spotify.com/track/${allTracks[0].id}` +
+    `?context=${encodeURIComponent(`spotify:playlist:${PLAYLIST_ID}`)}`;
 
   const feed = {
     generatedAt: nowIso,
@@ -389,6 +451,7 @@ async function main() {
       owner: playlist.owner,
       total: allTracks.length,
       spotifyUrl: `https://open.spotify.com/playlist/${PLAYLIST_ID}`,
+      playFirstUrl,
       appleMusicUrl:
         APPLE_PLAYLIST_URL ||
         `https://music.apple.com/${APPLE_STOREFRONT}/search?term=${encodeURIComponent(playlist.name || "")}`,
