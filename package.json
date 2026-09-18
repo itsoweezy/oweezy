@@ -1,0 +1,11 @@
+{
+  "name": "ascii-playlist-feed",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch-playlist": "node scripts/fetch-playlist.mjs"
+  },
+  "dependencies": {
+    "sharp": "^0.35.4"
+  }
+}
