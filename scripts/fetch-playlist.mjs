@@ -5,24 +5,34 @@
 // every track, and writes the result to playlist.json.
 //
 // Runs in GitHub Actions (see update-playlist.yml) — never in the browser —
-// because (a) the client secret is a secret and (b) Spotify's CDN images
-// can't be read pixel-by-pixel from client-side JS due to CORS.
+// because Spotify's CDN images can't be read pixel-by-pixel from client-side
+// JS due to CORS.
 //
-// Requires: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment
-// variables (see SETUP.md). No user login, no token refresh dance — the
-// client-credentials flow reads public playlists and the token it returns
-// is fetched fresh on every run.
+// NO SPOTIFY CREDENTIALS NEEDED. The track list comes from the public embed
+// page (https://open.spotify.com/embed/playlist/<id>) — the same page Spotify
+// serves for its "Share > Embed" iframe. That's unofficial: Spotify can change
+// the page at any time, and its developer terms are not friendly to scraping.
+// If a run fails, see the "Embed page" section and the DEBUG_EMBED note below.
+//
+// What the embed page gives us:   track id, title, artists, duration.
+// What it does NOT give us:       album name, release year, cover art, or the
+//                                 date a track was added. So:
+//   - cover art  -> Spotify's public oEmbed endpoint (exact cover), falling
+//                   back to the iTunes artwork for the matched song
+//   - album/year -> the iTunes Search API match (blank if no confident match)
+//   - "added"    -> the first time THIS script saw the track, remembered in
+//                   playlist.json under `seen` (see "First-seen dates")
+//
+// Optional env vars:
+//   SPOTIFY_PLAYLIST_ID     override the playlist
+//   APPLE_MUSIC_PLAYLIST_URL  link for the widget's Apple Music chip
+//   SPOTIFY_TRACK_ORDER     "newest-last" (default; Spotify appends new songs
+//                           to the bottom) or "newest-first"
+//   DEBUG_EMBED=1           also write embed-debug.json (the raw embed data),
+//                           handy for seeing what changed if parsing breaks
 
 import fs from "node:fs/promises";
 import sharp from "sharp";
-
-const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
-
-if (!CLIENT_ID || !CLIENT_SECRET) {
-  console.error("Missing SPOTIFY_CLIENT_ID and/or SPOTIFY_CLIENT_SECRET.");
-  process.exit(1);
-}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -38,65 +48,129 @@ const APPLE_PLAYLIST_URL =
   process.env.APPLE_MUSIC_PLAYLIST_URL ||
   "https://music.apple.com/us/playlist/this-is-owen-lantz/pl.u-BNA6z9jsRNM0DJ1";
 
+const TRACK_ORDER = (process.env.SPOTIFY_TRACK_ORDER || "newest-last").toLowerCase();
+
 const TRACK_LIMIT = 8;      // how many recent additions to render
 const ART_WIDTH = 44;       // characters wide
 const CHAR_ASPECT = 0.5;    // monospace chars are ~2x taller than wide
 const APPLE_STOREFRONT = "us";
+
+// Embed pages appear to cap how many tracks they list (reports say 50 or 100).
+// If we get exactly one of these back we warn, because a playlist longer than
+// the cap would make "newest-last" show the wrong songs.
+const KNOWN_EMBED_CAPS = [50, 100];
 
 // Brightness -> character, light to dense. Dark source pixels map to
 // space (fade into the black background); bright pixels map to the
 // densest character. Flip the string to invert.
 const ASCII_RAMP = " .:-=+*#%@";
 
+const EMBED_URL = `https://open.spotify.com/embed/playlist/${PLAYLIST_ID}`;
+const BROWSER_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+function fetchWithTimeout(url, options = {}, ms = 20000) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(ms) });
+}
+
 // ---------------------------------------------------------------------------
-// Spotify
+// Embed page
 // ---------------------------------------------------------------------------
 
-async function getAccessToken() {
-  const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
-  const res = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+// The embed page is a Next.js app; the playlist data is inlined as JSON in a
+// <script id="__NEXT_DATA__"> tag. We don't rely on the exact path to the data
+// (it has moved before) — we just search the JSON for the object that owns a
+// `trackList` array.
+
+async function fetchEmbedData() {
+  const res = await fetchWithTimeout(EMBED_URL, { headers: BROWSER_HEADERS });
+  if (!res.ok) {
+    throw new Error(`Embed page returned HTTP ${res.status} (${EMBED_URL})`);
+  }
+  const html = await res.text();
+  const match = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) {
+    throw new Error(
+      "Embed page loaded but has no __NEXT_DATA__ block. Spotify may have " +
+        "changed the page, or served a bot check to this IP."
+    );
+  }
+  return JSON.parse(match[1]);
+}
+
+function findEntity(node) {
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node.trackList)) return node;
+  for (const value of Object.values(node)) {
+    const found = findEntity(value);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Spotify pads multi-artist strings with non-breaking spaces.
+const clean = (s) => String(s ?? "").replace(/\u00a0/g, " ").trim();
+
+function parseEmbed(nextData) {
+  const entity = findEntity(nextData);
+  if (!entity) {
+    throw new Error(
+      "Could not find a trackList in the embed data. Re-run with DEBUG_EMBED=1 " +
+        "and look at embed-debug.json to see what Spotify is serving now."
+    );
+  }
+
+  const tracks = entity.trackList
+    .map((t) => {
+      const id = /^spotify:track:([A-Za-z0-9]+)$/.exec(t?.uri || "")?.[1];
+      if (!id) return null; // episodes, local files, etc.
+
+      // Durations are milliseconds; if a value looks like seconds, convert.
+      const raw = Number(t.duration) || 0;
+      return {
+        id,
+        name: clean(t.title) || "untitled",
+        artist: clean(t.subtitle) || "Unknown artist",
+        durationMs: raw > 0 && raw < 10000 ? raw * 1000 : raw,
+      };
+    })
+    .filter(Boolean);
+
+  if (tracks.length === 0) {
+    throw new Error("The embed's trackList was empty or had no playable tracks.");
+  }
+
+  return {
+    playlist: {
+      name: clean(entity.name || entity.title),
+      description: clean(entity.description),
+      owner: clean(entity.subtitle),
     },
-    body: "grant_type=client_credentials",
-  });
-  if (!res.ok) {
-    throw new Error(`Spotify auth failed ${res.status}: ${await res.text()}`);
-  }
-  const { access_token } = await res.json();
-  return access_token;
+    tracks,
+  };
 }
 
-async function spotify(path, token) {
-  const res = await fetch(`https://api.spotify.com/v1${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    throw new Error(`Spotify API error ${res.status} on ${path}: ${await res.text()}`);
+// ---------------------------------------------------------------------------
+// Cover art
+// ---------------------------------------------------------------------------
+
+// Spotify's public oEmbed endpoint returns a thumbnail of the track's cover.
+async function findSpotifyCover(trackId) {
+  try {
+    const url =
+      "https://open.spotify.com/oembed?url=" +
+      encodeURIComponent(`https://open.spotify.com/track/${trackId}`);
+    const res = await fetchWithTimeout(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { thumbnail_url } = await res.json();
+    return thumbnail_url || null;
+  } catch (err) {
+    console.warn(`Spotify cover lookup failed for ${trackId}: ${err.message}`);
+    return null;
   }
-  return res.json();
-}
-
-async function fetchPlaylistMeta(token) {
-  const fields = "name,description,external_urls,owner(display_name),tracks(total)";
-  return spotify(`/playlists/${PLAYLIST_ID}?fields=${encodeURIComponent(fields)}`, token);
-}
-
-async function fetchAllItems(token) {
-  const fields =
-    "next,items(added_at,track(id,name,duration_ms,external_urls,artists(name),album(name,release_date,images)))";
-  const items = [];
-  let path = `/playlists/${PLAYLIST_ID}/tracks?limit=100&fields=${encodeURIComponent(fields)}`;
-
-  while (path) {
-    const page = await spotify(path, token);
-    items.push(...(page.items || []));
-    // `next` comes back as a full URL; strip the base so spotify() can reuse it.
-    path = page.next ? page.next.replace("https://api.spotify.com/v1", "") : null;
-  }
-  return items;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,41 +178,47 @@ async function fetchAllItems(token) {
 // ---------------------------------------------------------------------------
 
 // The public iTunes Search API needs no key and returns Apple Music URLs.
-// We match on artist + title; if nothing convincing comes back we fall back
-// to a prefilled Apple Music search so the link is never dead.
-async function findAppleMusicUrl(trackName, artistName) {
+// We match on artist + title. A "strict" match (both agree) is trusted for
+// album/year/artwork too; a "loose" match (title only) is only used for the
+// link, as before. If nothing comes back we fall back to a prefilled Apple
+// Music search so the link is never dead.
+const norm = (s) =>
+  String(s ?? "")
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+
+const overlaps = (a, b) => Boolean(a && b && (a.includes(b) || b.includes(a)));
+
+async function findAppleMusic(trackName, artistName) {
   const term = `${artistName} ${trackName}`;
+  const searchUrl = `https://music.apple.com/${APPLE_STOREFRONT}/search?term=${encodeURIComponent(term)}`;
   const url =
     `https://itunes.apple.com/search?term=${encodeURIComponent(term)}` +
     `&entity=song&limit=5&country=${APPLE_STOREFRONT}`;
 
   try {
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { results = [] } = await res.json();
 
-    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
     const wantTrack = norm(trackName);
     const wantArtist = norm(artistName);
 
-    const hit =
-      results.find(
-        (r) =>
-          norm(r.trackName || "").includes(wantTrack) &&
-          norm(r.artistName || "").includes(wantArtist)
-      ) ||
-      results.find((r) => norm(r.trackName || "").includes(wantTrack)) ||
-      null;
+    const strict = results.find(
+      (r) => overlaps(norm(r.trackName), wantTrack) && overlaps(norm(r.artistName), wantArtist)
+    );
+    const hit = strict || results.find((r) => overlaps(norm(r.trackName), wantTrack));
 
     if (hit?.trackViewUrl) {
       // Strip iTunes affiliate/campaign noise, keep the clean Apple Music link.
-      return hit.trackViewUrl.split("?")[0];
+      return { url: hit.trackViewUrl.split("?")[0], match: strict || null };
     }
   } catch (err) {
     console.warn(`Apple Music lookup failed for "${trackName}": ${err.message}`);
   }
 
-  return `https://music.apple.com/${APPLE_STOREFRONT}/search?term=${encodeURIComponent(term)}`;
+  return { url: searchUrl, match: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +226,7 @@ async function findAppleMusicUrl(trackName, artistName) {
 // ---------------------------------------------------------------------------
 
 async function imageToAscii(imageUrl) {
-  const res = await fetch(imageUrl);
+  const res = await fetchWithTimeout(imageUrl);
   if (!res.ok) throw new Error(`Could not download cover: ${res.status}`);
   const buffer = Buffer.from(await res.arrayBuffer());
 
@@ -175,6 +255,46 @@ async function imageToAscii(imageUrl) {
 }
 
 // ---------------------------------------------------------------------------
+// First-seen dates
+// ---------------------------------------------------------------------------
+
+// The embed page doesn't say when a track was added, so we remember when this
+// script first saw each track. playlist.json carries a `seen` map
+// ({ trackId: ISO date | null }) for every track in the playlist.
+//
+// The first run has no history, so every existing track is recorded as `null`
+// (unknown — the widget just hides the "3d" label) rather than pretending they
+// were all added today. Anything that shows up after that gets a real date.
+// If an older playlist.json (from the Spotify-API version) is present, its
+// real `addedAt` values are carried over.
+
+async function readPrevious() {
+  try {
+    return JSON.parse(await fs.readFile("playlist.json", "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function buildSeenMap(allTracks, previous, nowIso) {
+  let prevSeen = previous?.seen;
+  let isBaseline = false;
+
+  if (!prevSeen) {
+    isBaseline = true;
+    prevSeen = Object.fromEntries(
+      (previous?.tracks || []).map((t) => [t.id, t.addedAt ?? null])
+    );
+  }
+
+  const seen = {};
+  for (const t of allTracks) {
+    seen[t.id] = t.id in prevSeen ? prevSeen[t.id] : isBaseline ? null : nowIso;
+  }
+  return seen;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -196,71 +316,85 @@ function duration(ms) {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
-function pickCover(album) {
-  const images = album?.images || [];
-  // Prefer a mid-size image — 640px is overkill for a 44-char render.
-  return (images.find((i) => i.width && i.width <= 400) || images[0])?.url || null;
-}
+const hiRes = (url) => url?.replace(/\/\d+x\d+bb\./, "/400x400bb.");
+const stripAlbumSuffix = (s) => String(s || "").replace(/ - (Single|EP)$/i, "");
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const token = await getAccessToken();
-  const [meta, items] = await Promise.all([
-    fetchPlaylistMeta(token),
-    fetchAllItems(token),
-  ]);
+  const [nextData, previous] = await Promise.all([fetchEmbedData(), readPrevious()]);
 
-  const usable = items.filter((i) => i.track && i.track.id);
+  if (process.env.DEBUG_EMBED) {
+    await fs.writeFile("embed-debug.json", JSON.stringify(nextData, null, 2));
+    console.log("Wrote embed-debug.json");
+  }
 
-  // Newest additions first. Playlists with no added_at (some algorithmic ones)
-  // fall back to reverse playlist order, which is the next best guess.
-  const hasDates = usable.some((i) => i.added_at);
-  const ordered = hasDates
-    ? [...usable].sort((a, b) => new Date(b.added_at) - new Date(a.added_at))
-    : [...usable].reverse();
+  const { playlist, tracks: allTracks } = parseEmbed(nextData);
+
+  if (KNOWN_EMBED_CAPS.includes(allTracks.length)) {
+    console.warn(
+      `The embed returned exactly ${allTracks.length} tracks, which may be its cap. ` +
+        `If the playlist is longer, "recent additions" could be wrong.`
+    );
+  }
+
+  const nowIso = new Date().toISOString();
+  const seen = buildSeenMap(allTracks, previous, nowIso);
+
+  const ordered = TRACK_ORDER === "newest-first" ? allTracks : [...allTracks].reverse();
 
   const tracks = [];
-  for (const item of ordered.slice(0, TRACK_LIMIT)) {
-    const t = item.track;
-    const artist = (t.artists || []).map((a) => a.name).join(", ") || "Unknown artist";
-    const cover = pickCover(t.album);
+  for (const t of ordered.slice(0, TRACK_LIMIT)) {
+    const firstArtist = t.artist.split(",")[0].trim();
 
-    try {
-      tracks.push({
-        id: t.id,
-        name: t.name,
-        artist,
-        album: t.album?.name || "",
-        year: (t.album?.release_date || "").slice(0, 4),
-        duration: duration(t.duration_ms),
-        addedAt: item.added_at || null,
-        timeAgo: timeAgo(item.added_at),
-        spotifyUrl: t.external_urls?.spotify || "",
-        appleMusicUrl: await findAppleMusicUrl(t.name, (t.artists || [])[0]?.name || artist),
-        art: cover ? await imageToAscii(cover) : "",
-      });
-    } catch (err) {
-      console.warn(`Skipping "${t.name}": ${err.message}`);
+    const [apple, spotifyCover] = await Promise.all([
+      findAppleMusic(t.name, firstArtist),
+      findSpotifyCover(t.id),
+    ]);
+
+    // Prefer Spotify's own cover; fall back to iTunes artwork for a confident match.
+    const coverUrl = spotifyCover || hiRes(apple.match?.artworkUrl100) || null;
+    let art = "";
+    if (coverUrl) {
+      try {
+        art = await imageToAscii(coverUrl);
+      } catch (err) {
+        console.warn(`No art for "${t.name}": ${err.message}`);
+      }
     }
+
+    tracks.push({
+      id: t.id,
+      name: t.name,
+      artist: t.artist,
+      album: stripAlbumSuffix(apple.match?.collectionName),
+      year: (apple.match?.releaseDate || "").slice(0, 4),
+      duration: duration(t.durationMs),
+      addedAt: seen[t.id] ?? null,
+      timeAgo: timeAgo(seen[t.id]),
+      spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+      appleMusicUrl: apple.url,
+      art,
+    });
   }
 
   const feed = {
-    generatedAt: new Date().toISOString(),
+    generatedAt: nowIso,
     profile: { username: "jamesowenlantz" },
     playlist: {
-      name: meta.name || "",
-      description: meta.description || "",
-      owner: meta.owner?.display_name || "",
-      total: meta.tracks?.total ?? null,
-      spotifyUrl: meta.external_urls?.spotify || `https://open.spotify.com/playlist/${PLAYLIST_ID}`,
+      name: playlist.name,
+      description: playlist.description,
+      owner: playlist.owner,
+      total: allTracks.length,
+      spotifyUrl: `https://open.spotify.com/playlist/${PLAYLIST_ID}`,
       appleMusicUrl:
         APPLE_PLAYLIST_URL ||
-        `https://music.apple.com/${APPLE_STOREFRONT}/search?term=${encodeURIComponent(meta.name || "")}`,
+        `https://music.apple.com/${APPLE_STOREFRONT}/search?term=${encodeURIComponent(playlist.name || "")}`,
     },
     tracks,
+    seen, // bookkeeping for "added" times; the widget ignores it
   };
 
   await fs.writeFile("playlist.json", JSON.stringify(feed, null, 2));
