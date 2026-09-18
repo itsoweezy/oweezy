@@ -1105,7 +1105,7 @@ document.addEventListener('DOMContentLoaded', () => {
     var post = el('article', 'apf-post');
 
     var head = el('div', 'apf-post-head');
-    head.appendChild(el('span', 'apf-post-user', 'system'));
+    head.appendChild(el('span', 'apf-post-user', 'hello world'));
     post.appendChild(head);
 
     var well = el('div', 'apf-art-well');
@@ -1145,7 +1145,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       feedEl.innerHTML = '';
       if (!data.tracks || data.tracks.length === 0) {
-        renderFallback('playlist connected, but no tracks came back yet.');
+        renderFallback('playlist connected, but no tracks came back yet ¯\_(ツ)_/¯');
         return;
       }
       data.tracks.forEach(function (track, i) {
@@ -1153,7 +1153,7 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     })
     .catch(function () {
-      renderFallback('playlist not connected yet — run the fetch script, or wait for the next scheduled update. see SETUP.md.');
+      renderFallback('playlist not connected yet — should be here soon :)');
     });
 })();
 </script>
