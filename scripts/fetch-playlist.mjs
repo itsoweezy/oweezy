@@ -65,7 +65,7 @@ const APPLE_PLAYLIST_URL =
 const TRACK_ORDER = (process.env.SPOTIFY_TRACK_ORDER || "playlist").toLowerCase();
 
 const TRACK_LIMIT = 20;     // how many tracks to render
-const ART_WIDTH = 44;       // characters wide
+const ART_WIDTH = 52;       // characters wide
 const CHAR_ASPECT = 0.5;    // monospace chars are ~2x taller than wide
 const APPLE_STOREFRONT = "us";
 
@@ -79,10 +79,18 @@ const ITUNES_GAP_MS = process.env.ITUNES_GAP_MS ? Number(process.env.ITUNES_GAP_
 // be cut off and the "newest" songs would be missing.
 const KNOWN_EMBED_CAPS = [50, 100];
 
-// Brightness -> character, light to dense. Dark source pixels map to
-// space (fade into the black background); bright pixels map to the
-// densest character. Flip the string to invert.
-const ASCII_RAMP = " .:-=+*#%@";
+// Brightness -> character. Dark source pixels fade toward space (blends
+// into the black background); bright pixels get the densest block.
+//
+// This is the same 5-character set the header portrait uses (space, then
+// the three Unicode shade blocks, then a full block) rather than a long
+// run of ASCII letters/symbols. A previous attempt used a 70-character
+// ramp for more "levels", but letters at this render size don't read as
+// smooth shading — they read as noise, since every glyph is a different
+// shape. Smooth-looking shading with few, self-similar block characters
+// comes from *dithering* (see ditherToAscii below), not from cramming in
+// more distinct glyphs.
+const ASCII_RAMP = " ░▒▓█";
 
 const EMBED_URL = `https://open.spotify.com/embed/playlist/${PLAYLIST_ID}`;
 const BROWSER_HEADERS = {
@@ -252,6 +260,48 @@ async function findAppleMusic(trackName, artistName) {
 // ASCII
 // ---------------------------------------------------------------------------
 
+// Maps a grayscale buffer to characters from `ramp` using Floyd–Steinberg
+// error diffusion instead of rounding each pixel to the nearest level in
+// isolation. Rounding alone, with only 5 levels, produces flat banded
+// regions (a cheek turns into 3 or 4 solid blocks with hard edges).
+// Diffusing each pixel's rounding error into its neighbors spreads that
+// error out as a fine dither pattern instead, so the *average* density
+// over any small area still tracks the original brightness closely —
+// which is what actually reads as smooth shading at a glance, the same
+// trick behind classic newspaper halftones and old 1-bit image dithers.
+function ditherToAscii(data, width, height, ramp) {
+  const levels = ramp.length;
+  const step = 255 / (levels - 1);
+  // Float32Array so accumulated error can push a pixel outside 0-255
+  // before it gets clamped at quantization time below.
+  const buf = Float32Array.from(data);
+
+  let art = "";
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const original = buf[i];
+      const levelIndex = Math.max(0, Math.min(levels - 1, Math.round(original / step)));
+      const quantized = levelIndex * step;
+      const error = original - quantized;
+
+      art += ramp[levelIndex];
+
+      // Standard Floyd–Steinberg kernel:
+      //         *   7/16
+      //  3/16  5/16  1/16
+      if (x + 1 < width) buf[i + 1] += error * (7 / 16);
+      if (y + 1 < height) {
+        if (x - 1 >= 0) buf[i + width - 1] += error * (3 / 16);
+        buf[i + width] += error * (5 / 16);
+        if (x + 1 < width) buf[i + width + 1] += error * (1 / 16);
+      }
+    }
+    art += "\n";
+  }
+  return art.trimEnd();
+}
+
 async function imageToAscii(imageUrl) {
   const res = await fetchWithTimeout(imageUrl);
   if (!res.ok) throw new Error(`Could not download cover: ${res.status}`);
@@ -267,18 +317,11 @@ async function imageToAscii(imageUrl) {
     .resize(ART_WIDTH, height, { fit: "fill" })
     .grayscale()
     .normalise() // album covers are often low-contrast; this keeps the ramp readable
+    .sharpen()   // restores edge definition softened by the resize, before dithering
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  let art = "";
-  for (let y = 0; y < info.height; y++) {
-    for (let x = 0; x < info.width; x++) {
-      const brightness = data[y * info.width + x] / 255;
-      art += ASCII_RAMP[Math.round(brightness * (ASCII_RAMP.length - 1))];
-    }
-    art += "\n";
-  }
-  return art.trimEnd();
+  return ditherToAscii(data, info.width, info.height, ASCII_RAMP);
 }
 
 // ---------------------------------------------------------------------------
