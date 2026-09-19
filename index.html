@@ -628,7 +628,7 @@ ul{
     display: flex;
     justify-content: center;
     align-items: center;
-    padding: 22px 12px;
+    padding: 26px 12px;
     background: var(--apf-bg-well);
     border-top: 1px dashed var(--apf-border);
     border-bottom: 1px dashed var(--apf-border);
@@ -636,10 +636,10 @@ ul{
   }
   .apf-art-well pre {
     margin: 0;
-    font-size: 10px;
-    line-height: 1.05;
+    font-size: 13px;
+    line-height: 1.1;
     letter-spacing: 0.5px;
-    text-shadow: 0 0 5px var(--tint, var(--apf-glow));
+    text-shadow: 0 0 3px var(--tint, var(--apf-glow));
     color: var(--tint-color, var(--apf-purple));
   }
 
@@ -695,7 +695,7 @@ ul{
      widget itself is narrow, on any device. */
   @container (max-width: 400px) {
     .apf-profile { padding: 16px 14px; gap: 10px; }
-    .apf-art-well pre { font-size: 8.5px; }
+    .apf-art-well pre { font-size: 11px; }
     .apf-mark pre { font-size: 6px; }
   }
   /* Smallest widths: the tiny avatar no longer has room next to the name
@@ -710,7 +710,7 @@ ul{
   @supports not (container-type: inline-size) {
     @media (max-width: 400px) {
       .apf-profile { padding: 16px 14px; }
-      .apf-art-well pre { font-size: 8.5px; }
+      .apf-art-well pre { font-size: 11px; }
       .apf-mark pre { font-size: 6px; }
     }
   }
