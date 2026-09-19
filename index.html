@@ -650,10 +650,22 @@ ul{
   }
   .apf-art-well pre {
     margin: 0;
-    font-size: 13px;
+    /* Sized so the art's columns exactly fill the well, at any panel width:
+       (widget width - 2px border - 2 x 12px padding) / (columns x 0.6em per
+       character), with ~1% headroom (0.607) for fallback fonts whose characters
+       are a hair wider. The widget is min(470px, panel width) wide, and
+       --art-cols is set per cover by renderTrack() from the art itself (88
+       unless it says otherwise). The 0.6 and the line-height below must match
+       CELL_ADVANCE and LINE_HEIGHT in scripts/fetch-playlist.mjs, or covers
+       will look stretched or squashed. The plain px value is the fallback
+       where cqw units aren't supported. */
+    font-size: 8.4px;
+    font-size: calc((min(470px, 100cqw) - 26px) / (var(--art-cols, 88) * 0.607));
     line-height: 1.1;
-    letter-spacing: 0.5px;
-    text-shadow: 0 0 3px var(--tint, var(--apf-glow));
+    letter-spacing: 0;  /* anything above 0 leaves hairline seams between solid blocks */
+    -webkit-text-size-adjust: 100%;  /* stop mobile browsers "boosting" the small type */
+    text-size-adjust: 100%;
+    text-shadow: 0 0 2px var(--tint, var(--apf-glow));  /* tight glow: a wide one smears cell-level detail */
     color: var(--tint-color, var(--apf-purple));
   }
 
@@ -709,7 +721,6 @@ ul{
      widget itself is narrow, on any device. */
   @container (max-width: 400px) {
     .apf-profile { padding: 16px 14px; gap: 10px; }
-    .apf-art-well pre { font-size: 11px; }
     .apf-mark pre { font-size: 6px; }
   }
   /* Smallest widths: the tiny avatar no longer has room next to the name
@@ -724,8 +735,14 @@ ul{
   @supports not (container-type: inline-size) {
     @media (max-width: 400px) {
       .apf-profile { padding: 16px 14px; }
-      .apf-art-well pre { font-size: 11px; }
       .apf-mark pre { font-size: 6px; }
+    }
+    /* Cover art: the same sizing as above, but from the viewport, mirroring
+       how #apf-panel is sized (mobile: viewport minus 2 x 1.25rem padding;
+       desktop: clamp(320px, 34vw, 470px)). */
+    .apf-art-well pre { font-size: calc((min(470px, 100vw - 40px) - 26px) / (var(--art-cols, 88) * 0.607)); }
+    @media (min-width: 768px) {
+      .apf-art-well pre { font-size: calc((clamp(320px, 34vw, 470px) - 26px) / (var(--art-cols, 88) * 0.607)); }
     }
   }
 </style>
@@ -1118,6 +1135,10 @@ document.addEventListener('DOMContentLoaded', () => {
     artPre.setAttribute('role', 'img');
     artPre.setAttribute('aria-label', 'Album art for ' + (track.album || track.name));
     artPre.textContent = track.art || '';
+    // Tell the CSS how many columns this art has so its font-size makes exactly
+    // that many fill the well (older 52-column art and newer 88-column art both fit).
+    var artCols = (track.art || '').indexOf('\n');
+    if (artCols > 0) artPre.style.setProperty('--art-cols', artCols);
     well.appendChild(artPre);
     article.appendChild(well);
 
