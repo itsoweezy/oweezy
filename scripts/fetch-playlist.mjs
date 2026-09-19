@@ -65,7 +65,7 @@ const APPLE_PLAYLIST_URL =
 const TRACK_ORDER = (process.env.SPOTIFY_TRACK_ORDER || "playlist").toLowerCase();
 
 const TRACK_LIMIT = 20;     // how many tracks to render
-const ART_WIDTH = 44;       // characters wide
+const ART_WIDTH = 52;       // characters wide
 const CHAR_ASPECT = 0.5;    // monospace chars are ~2x taller than wide
 const APPLE_STOREFRONT = "us";
 
@@ -82,7 +82,12 @@ const KNOWN_EMBED_CAPS = [50, 100];
 // Brightness -> character, light to dense. Dark source pixels map to
 // space (fade into the black background); bright pixels map to the
 // densest character. Flip the string to invert.
-const ASCII_RAMP = " .:-=+*#%@";
+//
+// 70 levels (the classic Paul Bourke greyscale ramp) instead of the old
+// 10, so gradients across a cover — a face, a sky, a shadow — step much
+// more smoothly instead of banding into visible rings.
+const ASCII_RAMP =
+  " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
 
 const EMBED_URL = `https://open.spotify.com/embed/playlist/${PLAYLIST_ID}`;
 const BROWSER_HEADERS = {
@@ -267,6 +272,8 @@ async function imageToAscii(imageUrl) {
     .resize(ART_WIDTH, height, { fit: "fill" })
     .grayscale()
     .normalise() // album covers are often low-contrast; this keeps the ramp readable
+    .sharpen()   // resizing softens edges; this restores definition now that the
+                 // 70-level ramp can actually render it instead of flattening it
     .raw()
     .toBuffer({ resolveWithObject: true });
 
