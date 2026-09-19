@@ -30,7 +30,8 @@
 // Covers, albums and Apple Music links are looked up once per track and then
 // reused from the previous playlist.json, so a normal run makes almost no
 // iTunes/oEmbed calls. (Apple asks for ~20 iTunes calls a minute at most.)
-// Anything that failed or fell back to a search link is retried next run.
+// Anything that failed or fell back to a search link is retried next run, and
+// covers drawn with older ASCII settings are re-rendered (cover download only).
 //
 // Optional env vars:
 //   SPOTIFY_PLAYLIST_ID     override the playlist
@@ -39,13 +40,16 @@
 //                           in playlist order. "reverse": the LAST TRACK_LIMIT
 //                           tracks, last one first — since Spotify appends new
 //                           songs to the bottom, that's "newest first".
-//   REFRESH_ALL=1           ignore the cache and re-look-up every track
-//                           (use after changing ART_WIDTH or ASCII_RAMP)
+//   REFRESH_ALL=1           ignore the cache and re-look-up every track.
+//                           (Not needed after changing the ASCII settings: each
+//                           track remembers which settings drew its art, and
+//                           stale art is re-rendered automatically.)
 //   ITUNES_GAP_MS           pause between iTunes lookups (default 3100)
 //   DEBUG_EMBED=1           also write embed-debug.json (the raw embed data),
 //                           handy for seeing what changed if parsing breaks
 
 import fs from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import sharp from "sharp";
 
 // ---------------------------------------------------------------------------
@@ -65,8 +69,6 @@ const APPLE_PLAYLIST_URL =
 const TRACK_ORDER = (process.env.SPOTIFY_TRACK_ORDER || "playlist").toLowerCase();
 
 const TRACK_LIMIT = 20;     // how many tracks to render
-const ART_WIDTH = 52;       // characters wide
-const CHAR_ASPECT = 0.5;    // monospace chars are ~2x taller than wide
 const APPLE_STOREFRONT = "us";
 
 // Apple documents the iTunes Search API at "approximately 20 calls per minute"
@@ -78,19 +80,6 @@ const ITUNES_GAP_MS = process.env.ITUNES_GAP_MS ? Number(process.env.ITUNES_GAP_
 // if we get exactly one of these back we warn, because a longer playlist would
 // be cut off and the "newest" songs would be missing.
 const KNOWN_EMBED_CAPS = [50, 100];
-
-// Brightness -> character. Dark source pixels fade toward space (blends
-// into the black background); bright pixels get the densest block.
-//
-// This is the same 5-character set the header portrait uses (space, then
-// the three Unicode shade blocks, then a full block) rather than a long
-// run of ASCII letters/symbols. A previous attempt used a 70-character
-// ramp for more "levels", but letters at this render size don't read as
-// smooth shading — they read as noise, since every glyph is a different
-// shape. Smooth-looking shading with few, self-similar block characters
-// comes from *dithering* (see ditherToAscii below), not from cramming in
-// more distinct glyphs.
-const ASCII_RAMP = " ░▒▓█";
 
 const EMBED_URL = `https://open.spotify.com/embed/playlist/${PLAYLIST_ID}`;
 const BROWSER_HEADERS = {
@@ -260,68 +249,217 @@ async function findAppleMusic(trackName, artistName) {
 // ASCII
 // ---------------------------------------------------------------------------
 
-// Maps a grayscale buffer to characters from `ramp` using Floyd–Steinberg
-// error diffusion instead of rounding each pixel to the nearest level in
-// isolation. Rounding alone, with only 5 levels, produces flat banded
-// regions (a cheek turns into 3 or 4 solid blocks with hard edges).
-// Diffusing each pixel's rounding error into its neighbors spreads that
-// error out as a fine dither pattern instead, so the *average* density
-// over any small area still tracks the original brightness closely —
-// which is what actually reads as smooth shading at a glance, the same
-// trick behind classic newspaper halftones and old 1-bit image dithers.
-function ditherToAscii(data, width, height, ramp) {
-  const levels = ramp.length;
-  const step = 255 / (levels - 1);
-  // Float32Array so accumulated error can push a pixel outside 0-255
-  // before it gets clamped at quantization time below.
-  const buf = Float32Array.from(data);
+// Geometry. These three numbers describe how the widget draws a character
+// cell, and the art is only proportioned correctly when they match the CSS
+// for `.apf-art-well pre` in index.html:
+//   - ART_WIDTH   : characters per row. index.html sizes the font so this many
+//                   columns exactly fill the widget (see the font-size calc()
+//                   there, which divides by ART_WIDTH * CELL_ADVANCE).
+//   - CELL_ADVANCE: character width in em (0.6 for IBM Plex Mono and Courier).
+//   - LINE_HEIGHT : CSS line-height in em. Also keeps solid blocks seamless.
+// Covers are square, so with a 0.6 x 1.1 cell the art needs ~0.545 rows per
+// column. (The previous version assumed cells were exactly twice as tall as
+// wide, but the CSS drew them ~1.7x, which squashed every cover by ~14%.)
+const ART_WIDTH = 88;
+const CELL_ADVANCE = 0.6;
+const LINE_HEIGHT = 1.1;
+const CELL_ASPECT = CELL_ADVANCE / LINE_HEIGHT; // width / height of one character
 
-  let art = "";
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = y * width + x;
-      const original = buf[i];
-      const levelIndex = Math.max(0, Math.min(levels - 1, Math.round(original / step)));
-      const quantized = levelIndex * step;
-      const error = original - quantized;
+// Palette. Every glyph is described by how much of each quadrant it fills:
+// [top-left, top-right, bottom-left, bottom-right], 0 = empty, 1 = solid.
+// The five shade characters are the same ones the header portrait uses. The
+// four half blocks add real *shape* to the palette: at a hard edge (a letter,
+// a horizon, the rim of a circle) a cell can be "top half lit" instead of
+// having to pick a shade that's wrong on both sides. They live in the same
+// Unicode block as the shades, so they render in the same font.
+const GLYPHS = [
+  { ch: " ", q: [0, 0, 0, 0] },
+  { ch: "░", q: [0.25, 0.25, 0.25, 0.25] },
+  { ch: "▒", q: [0.5, 0.5, 0.5, 0.5] },
+  { ch: "▓", q: [0.75, 0.75, 0.75, 0.75] },
+  { ch: "█", q: [1, 1, 1, 1] },
+  { ch: "▀", q: [1, 1, 0, 0] },
+  { ch: "▄", q: [0, 0, 1, 1] },
+  { ch: "▌", q: [1, 0, 1, 0] },
+  { ch: "▐", q: [0, 1, 0, 1] },
+];
 
-      art += ramp[levelIndex];
+// Tone. Album covers are wildly different (a blown-out photo, a near-black
+// moody one, a flat graphic), so each image is levelled on its own.
+const LEVELS_LOW = 0.03;   // darkest 3% of pixels -> black
+const LEVELS_HIGH = 0.99;  // brightest 1% -> white
+const GAMMA = 1.35;        // >1 darkens midtones: shade blocks glow on black, so
+                           // this keeps dark backgrounds clean and subjects popping
+const CLARITY = 0.45;      // wide-radius local contrast (separates subject from ground)
+const SHARPEN = 0.9;       // fine-radius unsharp mask (edges, lettering)
+const FLAT_TOLERANCE = 0.07; // brightness error smaller than this is ignored rather than
+                           // diffused. Flat areas then stay one calm tone instead of
+                           // dithering into a checkerboard, while real gradients (whose
+                           // error is larger) still dither smoothly. 0 = plain Floyd-Steinberg.
 
-      // Standard Floyd–Steinberg kernel:
-      //         *   7/16
-      //  3/16  5/16  1/16
-      if (x + 1 < width) buf[i + 1] += error * (7 / 16);
-      if (y + 1 < height) {
-        if (x - 1 >= 0) buf[i + width - 1] += error * (3 / 16);
-        buf[i + width] += error * (5 / 16);
-        if (x + 1 < width) buf[i + width + 1] += error * (1 / 16);
+// Bumped automatically whenever any setting above changes. It's saved with each
+// track so main() knows which cached covers were drawn with older settings and
+// need re-rendering.
+const ART_SPEC = [
+  "v2", ART_WIDTH, CELL_ASPECT.toFixed(3), GLYPHS.map((g) => g.ch).join(""),
+  LEVELS_LOW, LEVELS_HIGH, GAMMA, CLARITY, SHARPEN, FLAT_TOLERANCE,
+].join("|");
+
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+// Separable Gaussian blur on a float image (edges clamp).
+function gaussianBlur(src, w, h, sigma) {
+  const radius = Math.max(1, Math.ceil(sigma * 3));
+  const kernel = new Float32Array(radius * 2 + 1);
+  let sum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    kernel[i + radius] = Math.exp(-(i * i) / (2 * sigma * sigma));
+    sum += kernel[i + radius];
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= sum;
+
+  const tmp = new Float32Array(src.length);
+  const out = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let k = -radius; k <= radius; k++) {
+        acc += src[y * w + Math.min(w - 1, Math.max(0, x + k))] * kernel[k + radius];
+      }
+      tmp[y * w + x] = acc;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let k = -radius; k <= radius; k++) {
+        acc += tmp[Math.min(h - 1, Math.max(0, y + k)) * w + x] * kernel[k + radius];
+      }
+      out[y * w + x] = acc;
+    }
+  }
+  return out;
+}
+
+// Grayscale bytes -> tone-mapped floats in 0..1: per-image levels, then local
+// contrast, then gamma.
+function toneMap(gray, w, h) {
+  const hist = new Uint32Array(256);
+  for (const v of gray) hist[v]++;
+  const percentile = (p) => {
+    const target = p * gray.length;
+    let acc = 0;
+    for (let i = 0; i < 256; i++) {
+      acc += hist[i];
+      if (acc >= target) return i / 255;
+    }
+    return 1;
+  };
+  let lo = percentile(LEVELS_LOW);
+  let hi = percentile(LEVELS_HIGH);
+  if (hi - lo < 0.08) {
+    // A nearly flat image (an all-black or all-white cover, say): stretching
+    // would only blow sensor noise up to full contrast, and would drag a black
+    // cover to mid-grey. Keep its real brightness instead.
+    lo = 0;
+    hi = 1;
+  }
+
+  const f = new Float32Array(gray.length);
+  for (let i = 0; i < f.length; i++) f[i] = clamp01((gray[i] / 255 - lo) / (hi - lo));
+
+  const wide = gaussianBlur(f, w, h, w / 14);
+  const fine = gaussianBlur(f, w, h, 1.1);
+  const out = new Float32Array(f.length);
+  for (let i = 0; i < f.length; i++) {
+    const v = f[i] + CLARITY * (f[i] - wide[i]) + SHARPEN * (f[i] - fine[i]);
+    out[i] = Math.pow(clamp01(v), GAMMA);
+  }
+  return out;
+}
+
+// Turns a tone-mapped image (2 samples per character across, 2 down) into text.
+//
+// For each character cell we look at its four samples and pick the glyph whose
+// quadrants best match them, so lettering and edges keep their shape instead of
+// being averaged into a shade. The leftover *brightness* error (how much
+// lighter or darker the chosen glyph is than the cell wanted) is then diffused
+// into neighbouring cells, Floyd-Steinberg style (minus a small dead zone, see
+// FLAT_TOLERANCE), so gradients still read as smooth shading. The scan direction alternates every row (serpentine) to avoid
+// the diagonal "worm" streaks a one-way scan leaves in flat areas.
+function cellsToText(f, cols, rows) {
+  const hw = cols * 2;
+  const carry = new Float32Array(cols * rows);
+  const lines = [];
+
+  for (let y = 0; y < rows; y++) {
+    const dir = y % 2 === 0 ? 1 : -1;
+    const row = new Array(cols);
+
+    for (let n = 0; n < cols; n++) {
+      const x = dir === 1 ? n : cols - 1 - n;
+      const c = carry[y * cols + x];
+      const i = y * 2 * hw + x * 2;
+      const t = [
+        clamp01(f[i] + c),
+        clamp01(f[i + 1] + c),
+        clamp01(f[i + hw] + c),
+        clamp01(f[i + hw + 1] + c),
+      ];
+
+      let best = GLYPHS[0];
+      let bestCost = Infinity;
+      for (const g of GLYPHS) {
+        let cost = 0;
+        for (let k = 0; k < 4; k++) cost += (t[k] - g.q[k]) ** 2;
+        if (cost < bestCost) {
+          bestCost = cost;
+          best = g;
+        }
+      }
+      row[x] = best.ch;
+
+      const want = (t[0] + t[1] + t[2] + t[3]) / 4;
+      const got = (best.q[0] + best.q[1] + best.q[2] + best.q[3]) / 4;
+      const miss = want - got;
+      const err = Math.sign(miss) * Math.max(0, Math.abs(miss) - FLAT_TOLERANCE);
+      const at = y * cols + x;
+      const ahead = x + dir;
+      const behind = x - dir;
+      if (ahead >= 0 && ahead < cols) carry[at + dir] += err * (7 / 16);
+      if (y + 1 < rows) {
+        if (behind >= 0 && behind < cols) carry[at + cols - dir] += err * (3 / 16);
+        carry[at + cols] += err * (5 / 16);
+        if (ahead >= 0 && ahead < cols) carry[at + cols + dir] += err * (1 / 16);
       }
     }
-    art += "\n";
+    lines.push(row.join(""));
   }
-  return art.trimEnd();
+  return lines.join("\n");
+}
+
+// Image bytes -> ASCII. Exported so the converter can be tested on its own.
+export async function coverToAscii(buffer) {
+  const meta = await sharp(buffer).metadata();
+  const rows = Math.max(1, Math.round((meta.height / meta.width) * ART_WIDTH * CELL_ASPECT));
+
+  // Sample at 2x the character grid; cellsToText uses the extra resolution to
+  // pick shape-aware glyphs.
+  const { data, info } = await sharp(buffer)
+    .flatten({ background: "#000" }) // transparent PNG covers: treat as black
+    .resize(ART_WIDTH * 2, rows * 2, { fit: "fill", kernel: "lanczos3" })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const tone = toneMap(data, info.width, info.height);
+  return cellsToText(tone, ART_WIDTH, rows);
 }
 
 async function imageToAscii(imageUrl) {
   const res = await fetchWithTimeout(imageUrl);
   if (!res.ok) throw new Error(`Could not download cover: ${res.status}`);
-  const buffer = Buffer.from(await res.arrayBuffer());
-
-  const meta = await sharp(buffer).metadata();
-  const height = Math.max(
-    1,
-    Math.round((meta.height / meta.width) * ART_WIDTH * CHAR_ASPECT)
-  );
-
-  const { data, info } = await sharp(buffer)
-    .resize(ART_WIDTH, height, { fit: "fill" })
-    .grayscale()
-    .normalise() // album covers are often low-contrast; this keeps the ramp readable
-    .sharpen()   // restores edge definition softened by the resize, before dithering
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  return ditherToAscii(data, info.width, info.height, ASCII_RAMP);
+  return coverToAscii(Buffer.from(await res.arrayBuffer()));
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +557,23 @@ async function lookUpExtras(t) {
     year: (apple.match?.releaseDate || "").slice(0, 4),
     appleMusicUrl: apple.url,
     art,
+    artSpec: art ? ART_SPEC : null,
   };
+}
+
+// Re-draws just the cover (one Spotify oEmbed call plus the image download) for
+// a track whose other details are already cached. If that fails we keep the old
+// art rather than losing it, and it'll be tried again next run.
+async function refreshArt(t, cached) {
+  const coverUrl = await findSpotifyCover(t.id);
+  if (coverUrl) {
+    try {
+      return { art: await imageToAscii(coverUrl), artSpec: ART_SPEC };
+    } catch (err) {
+      console.warn(`Could not redraw art for "${t.name}": ${err.message}`);
+    }
+  }
+  return { art: cached.art, artSpec: cached.artSpec ?? null };
 }
 
 async function main() {
@@ -453,14 +607,24 @@ async function main() {
   const tracks = [];
   for (const t of ordered.slice(0, TRACK_LIMIT)) {
     const cached = process.env.REFRESH_ALL ? null : cache.get(t.id);
-    const extras = isComplete(cached)
-      ? {
-          album: cached.album || "",
-          year: cached.year || "",
-          appleMusicUrl: cached.appleMusicUrl,
-          art: cached.art,
-        }
-      : await lookUpExtras(t);
+    let extras;
+    if (isComplete(cached)) {
+      extras = {
+        album: cached.album || "",
+        year: cached.year || "",
+        appleMusicUrl: cached.appleMusicUrl,
+        art: cached.art,
+        artSpec: cached.artSpec ?? null,
+      };
+      if (extras.artSpec !== ART_SPEC) Object.assign(extras, await refreshArt(t, cached));
+    } else {
+      extras = await lookUpExtras(t);
+      // A transient cover failure shouldn't blank art we already had.
+      if (!extras.art && cached?.art) {
+        extras.art = cached.art;
+        extras.artSpec = cached.artSpec ?? null;
+      }
+    }
 
     tracks.push({
       id: t.id,
@@ -474,6 +638,7 @@ async function main() {
       spotifyUrl: `https://open.spotify.com/track/${t.id}`,
       appleMusicUrl: extras.appleMusicUrl,
       art: extras.art,
+      artSpec: extras.artSpec, // bookkeeping: which ASCII settings drew `art`; the widget ignores it
     });
   }
 
@@ -507,7 +672,10 @@ async function main() {
   console.log(`Wrote playlist.json with ${tracks.length} track(s).`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only run when executed directly (node fetch-playlist.mjs), not when imported.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
