@@ -14,7 +14,13 @@ name: Update ASCII playlist feed
 on:
   schedule:
     - cron: "0 */6 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      refresh_all:
+        description: "Force a full refresh (ignore cache, re-render every track's art)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,6 +44,9 @@ jobs:
           # Optional overrides — safe to leave unset.
           SPOTIFY_PLAYLIST_ID: ${{ vars.SPOTIFY_PLAYLIST_ID }}
           APPLE_MUSIC_PLAYLIST_URL: ${{ vars.APPLE_MUSIC_PLAYLIST_URL }}
+          # Only set on a manual run with the "refresh_all" checkbox ticked;
+          # the scheduled runs leave this unset so caching still applies.
+          REFRESH_ALL: ${{ inputs.refresh_all && '1' || '' }}
 
       - name: Commit updated playlist
         run: |
