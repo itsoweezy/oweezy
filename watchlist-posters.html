@@ -11,7 +11,7 @@ box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:en
 html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
 *{box-sizing:border-box}
 body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Bricolage Grotesque",system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;display:flex;flex-direction:column;justify-content:center;-webkit-text-size-adjust:100%}
-.track{--h:max(150px,min(calc((100vh - 165px)/1.4),480px,100vw));--w:calc(var(--h)*.714);--gap:clamp(14px,3vw,32px);flex:none;display:flex;align-items:center;gap:var(--gap);overflow-x:auto;overflow-y:hidden;padding:12px calc(50% - var(--w)/2) calc(var(--w)*.56);scroll-snap-type:x mandatory;scrollbar-width:none;outline:none;cursor:grab}
+.track{--h:max(150px,min(calc((100vh - 110px)/1.4),480px,100vw));--w:calc(var(--h)*.714);--gap:clamp(14px,3vw,32px);flex:none;display:flex;align-items:center;gap:var(--gap);overflow-x:auto;overflow-y:hidden;padding:12px calc(50% - var(--w)/2) calc(var(--w)*.56);scroll-snap-type:x mandatory;scrollbar-width:none;outline:none;cursor:grab;-webkit-mask-image:linear-gradient(to right,transparent 0,#000 14%,#000 86%,transparent 100%);mask-image:linear-gradient(to right,transparent 0,#000 14%,#000 86%,transparent 100%)}
 .track::-webkit-scrollbar{display:none}
 .track.dragging,.track.auto{scroll-snap-type:none}
 .track.dragging{cursor:grabbing;user-select:none}
@@ -20,11 +20,11 @@ body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Bri
 .card img{display:block;width:100%;height:100%;object-fit:cover;-webkit-user-drag:none;user-select:none}
 .refl{position:absolute;left:0;right:0;top:100%;margin-top:3px;height:45%;overflow:hidden;border-radius:0 0 10px 10px;pointer-events:none;-webkit-mask-image:linear-gradient(to bottom,rgba(0,0,0,.6),transparent 85%);mask-image:linear-gradient(to bottom,rgba(0,0,0,.6),transparent 85%)}
 .refl img{position:absolute;top:0;left:0;width:100%;height:222.3%;transform:scaleY(-1)}
-.info{width:100%;max-width:560px;margin:0 auto;padding:4px 20px 22px;text-align:center}
-.info h1{margin:0;min-height:2.5em;display:flex;align-items:center;justify-content:center;font-size:clamp(17px,4.2vw,25px);letter-spacing:-.01em}
-.info p{margin:4px 0 0;color:var(--muted);font-size:14px}
-.nav{display:flex;gap:28px;align-items:center;justify-content:center;margin-top:14px;flex-wrap:wrap}
-.nav button.step{width:44px;height:44px;border-radius:50%;border:0;background:var(--btn);color:var(--btn-ink);font-size:18px;cursor:pointer}
+.info{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;margin:0;padding:4px 16px 18px;text-align:left}
+.info h1{margin:0;min-height:2.4em;display:flex;align-items:center;font-size:clamp(13px,3.4vw,16px);letter-spacing:-.005em;line-height:1.2}
+.nav{display:flex;gap:2px;flex:none;margin:0}
+.nav button.step{border:0;background:none;color:var(--ink);font:700 15px "Courier New",Courier,monospace;padding:8px 10px;cursor:pointer;transition:color .2s}
+.nav button.step:hover{color:#9b59b6}
 .nav button:focus-visible,.track:focus-visible{outline:3px solid var(--ink);outline-offset:3px}
 .wrap{width:100%}
 </style>
@@ -35,8 +35,8 @@ body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Bri
 <div class="info">
   <h1 id="name"></h1>
   <div class="nav">
-    <button class="step" id="prev" aria-label="Previous show">&#8592;</button>
-    <button class="step" id="next" aria-label="Next show">&#8594;</button>
+    <button class="step" id="prev" aria-label="Previous show">&lt;-</button>
+    <button class="step" id="next" aria-label="Next show">-&gt;</button>
   </div>
 </div>
 </div>
