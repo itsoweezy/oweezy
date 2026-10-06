@@ -745,6 +745,17 @@ ul{
       .apf-art-well pre { font-size: calc((clamp(320px, 34vw, 470px) - 26px) / (var(--art-cols, 88) * 0.607)); }
     }
   }
+
+     .poster-embed{
+       display:block;
+       width:100%;
+       max-width:720px;
+       height:clamp(520px,64vw,640px);
+       border:0;
+       border-radius:10px;
+       background:#000;
+   }
+
 </style>
 
 <script>
@@ -1020,7 +1031,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         <li class="folder"><span class="folder-label">Post Production</span>
             <ul class="collapsed"><li class="file"><br><strong>Contributed to numerous chart-topping Netflix, HBO, Disney, and Amazon Prime shows</strong><br><br><strong>Services:</strong><br><br>-> Dubbing & ADR (recording, editing, & script adaptation)<br>-> Voiceover Recording & Editing (podcasts, audiobooks, video games)<br>-> Mixing, Scoring, Sound Design, & Foley<br>-> Project & Schedule Management<br>-> Data Management & Infrastructure Support
-                </li>
+                <br></li>
+                   <li class="file"><iframe class="poster-embed" src="watchlist-posters.html" loading="lazy" scrolling="no"></iframe></li>
                 <li class="file">
                     <strong><a href="#" class="hyperlink-class tree-shortcut" data-target="folder-projects-post">View selected Film & TV credits</a></strong>
                 <a href="https://www.imdb.com/name/nm15467264/"
