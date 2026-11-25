@@ -558,6 +558,7 @@ async function lookUpExtras(t) {
     appleMusicUrl: apple.url,
     art,
     artSpec: art ? ART_SPEC : null,
+    coverUrl,
   };
 }
 
@@ -568,12 +569,12 @@ async function refreshArt(t, cached) {
   const coverUrl = await findSpotifyCover(t.id);
   if (coverUrl) {
     try {
-      return { art: await imageToAscii(coverUrl), artSpec: ART_SPEC };
+      return { art: await imageToAscii(coverUrl), artSpec: ART_SPEC, coverUrl };
     } catch (err) {
       console.warn(`Could not redraw art for "${t.name}": ${err.message}`);
     }
   }
-  return { art: cached.art, artSpec: cached.artSpec ?? null };
+  return { art: cached.art, artSpec: cached.artSpec ?? null, coverUrl: coverUrl || cached.coverUrl || null };
 }
 
 async function main() {
@@ -615,8 +616,11 @@ async function main() {
         appleMusicUrl: cached.appleMusicUrl,
         art: cached.art,
         artSpec: cached.artSpec ?? null,
+        coverUrl: cached.coverUrl || null,
       };
       if (extras.artSpec !== ART_SPEC) Object.assign(extras, await refreshArt(t, cached));
+      // Tracks cached before covers were saved: one oEmbed call fills it in.
+      else if (!extras.coverUrl) extras.coverUrl = await findSpotifyCover(t.id);
     } else {
       extras = await lookUpExtras(t);
       // A transient cover failure shouldn't blank art we already had.
@@ -624,6 +628,7 @@ async function main() {
         extras.art = cached.art;
         extras.artSpec = cached.artSpec ?? null;
       }
+      if (!extras.coverUrl && cached?.coverUrl) extras.coverUrl = cached.coverUrl;
     }
 
     tracks.push({
@@ -639,6 +644,7 @@ async function main() {
       appleMusicUrl: extras.appleMusicUrl,
       art: extras.art,
       artSpec: extras.artSpec, // bookkeeping: which ASCII settings drew `art`; the widget ignores it
+      coverUrl: extras.coverUrl || null, // the real cover, revealed over the ASCII on hover / tap
     });
   }
 
