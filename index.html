@@ -669,6 +669,43 @@ ul{
     color: var(--tint-color, var(--apf-purple));
   }
 
+  /* ---------- real photo, revealed over the ASCII ----------
+     Used for the album covers and the profile picture. The frame
+     shrink-wraps the ASCII <pre>, and the photo sits exactly on top of it
+     (centre-cropped to fit), invisible until revealed: on mouse hover
+     (desktop) or by a tap (touch), both handled by setRevealed() in the
+     script. It "loads in" line by line through progressively finer pixel
+     passes, drawn into the .apf-art-pix canvas. */
+  .apf-art-frame {
+    position: relative;
+    flex: none;
+  }
+  .apf-art-frame.has-photo { cursor: pointer; }
+  .apf-art-photo {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    opacity: 0;
+    pointer-events: none;           /* the frame handles hover and taps */
+    -webkit-user-drag: none;
+    user-select: none;
+  }
+  .apf-art-frame.is-revealed .apf-art-photo { opacity: 1; }
+  .apf-art-photo { z-index: 1; }    /* above the pixel canvas, for the final fade */
+  .apf-art-pix {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .apf-art-frame.is-pixelating .apf-art-pix { visibility: visible; }
+
   .apf-caption {
     padding: 12px 16px 6px;
     font-size: 12.5px;
@@ -1126,6 +1163,231 @@ document.addEventListener('DOMContentLoaded', () => {
     return root.querySelector('#apf-name').textContent;
   }
 
+  // ---- ASCII -> photo reveal ------------------------------------------
+  // Loads in like a bitmap on a slow connection. The picture is cut into
+  // BANDS horizontal lines; top to bottom, each line paints in from left
+  // to right in coarse blocks, then keeps sharpening through finer passes
+  // (and finally fades into the photo itself) while the lines below load.
+  // Hiding runs the same thing backwards, faster. A reversal mid-way just
+  // turns around from wherever it is.
+  var BANDS = 8;
+  var PASSES = [16, 32, 64, 128];   // blocks across, coarse -> fine; the photo is the level after
+  var BAND_MS = 110;                // one line's left-to-right sweep (the next starts as it ends)
+  var SHARPEN_MS = 80;              // then each finer pass arrives this long after the last
+  var FADE_MS = 240;                // and the finest pass cross-fades into the photo over this long
+  var OUT_SPEED = 3;                // hiding runs this many times faster
+  var LINE_MS = BAND_MS + (PASSES.length - 1) * SHARPEN_MS + FADE_MS;   // one line, start to sharp
+  var TOTAL = (BANDS - 1) * BAND_MS + LINE_MS;                          // ~1.36s
+  var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+  // The photo as it appears in the frame (centre-cropped like the <img>'s
+  // object-fit: cover), at device resolution; the pixel passes are made
+  // from this so they line up with the real photo exactly. Drawn with the
+  // whole-image form of drawImage on purpose: for a srcset image,
+  // naturalWidth is density-corrected and doesn't match the bitmap a
+  // source rectangle would index into.
+  function fullImage(frame) {
+    var dpr = window.devicePixelRatio || 1;
+    var W = Math.max(1, Math.round(frame.clientWidth * dpr));
+    var H = Math.max(1, Math.round(frame.clientHeight * dpr));
+    if (!frame._full || frame._full.width !== W || frame._full.height !== H) {
+      frame._passes = [];                 // the frame changed size: rebuild everything
+      var photo = frame.querySelector('.apf-art-photo');
+      var nw = photo.naturalWidth || 1, nh = photo.naturalHeight || 1;
+      var scale = Math.max(W / nw, H / nh);
+      var c = document.createElement('canvas');
+      c.width = W;
+      c.height = H;
+      var cx = c.getContext('2d');
+      cx.imageSmoothingEnabled = true;
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(photo, (W - nw * scale) / 2, (H - nh * scale) / 2, nw * scale, nh * scale);
+      frame._full = c;
+    }
+    return frame._full;
+  }
+
+  // One small, downsampled copy of the photo per pass, built on first use.
+  function passImage(frame, k) {
+    frame._passes = frame._passes || [];
+    if (!frame._passes[k]) {
+      var full = fullImage(frame);
+      var c = document.createElement('canvas');
+      c.width = PASSES[k];
+      c.height = Math.max(1, Math.round(PASSES[k] * full.height / full.width));
+      var cx = c.getContext('2d');
+      cx.imageSmoothingEnabled = true;
+      cx.imageSmoothingQuality = 'high';   // average the photo, don't just sample it
+      cx.drawImage(full, 0, 0, c.width, c.height);
+      frame._passes[k] = c;
+    }
+    return frame._passes[k];
+  }
+
+  function setPhotoMask(photo, mask) {
+    photo.style.opacity = mask ? '1' : '';
+    photo.style.webkitMaskImage = mask;
+    photo.style.maskImage = mask;
+  }
+
+  // _p is a position on the reveal's timeline, 0 (ASCII) to TOTAL (photo).
+  function renderReveal(frame) {
+    var p = frame._p;
+    var pix = frame.querySelector('.apf-art-pix');
+    var photo = frame.querySelector('.apf-art-photo');
+    var done = p >= TOTAL;
+    frame.classList.toggle('is-pixelating', p > 0 && !done);
+    frame.classList.toggle('is-revealed', done);
+    if (p <= 0 || done) {
+      setPhotoMask(photo, '');
+      return;
+    }
+
+    var full = fullImage(frame);
+    var W = full.width, H = full.height;
+    if (pix.width !== W || pix.height !== H) {
+      pix.width = W;
+      pix.height = H;
+    }
+    var ctx = pix.getContext('2d');
+    ctx.imageSmoothingEnabled = false;    // crisp, blocky pixels
+    ctx.clearRect(0, 0, W, H);
+
+    // The real photo sits above the canvas and fades in line by line
+    // through a stepped mask, so the end of the reveal is just that fade
+    // finishing: nothing gets swapped out.
+    var fadeFrom = BAND_MS + (PASSES.length - 1) * SHARPEN_MS;   // a line's age when its fade starts
+    var stops = [], anyPhoto = false;
+    for (var b = 0; b < BANDS; b++) {
+      var age = p - b * BAND_MS;          // how long this line has been loading
+      var t = Math.max(0, Math.min(1, (age - fadeFrom) / FADE_MS));
+      var alpha = t * t * (3 - 2 * t);    // eased
+      if (alpha > 0) anyPhoto = true;
+      stops.push('rgba(0,0,0,' + alpha.toFixed(3) + ') ' + (b / BANDS * 100) + '% ' + ((b + 1) / BANDS * 100) + '%');
+      if (age <= 0 || alpha >= 1) continue;
+
+      // Pixel pass: whole columns of blocks, left to right while the line
+      // is sweeping, then the full line at each finer pass.
+      var level = age < BAND_MS ? 0 : Math.min(PASSES.length - 1, 1 + Math.floor((age - BAND_MS) / SHARPEN_MS));
+      var img = passImage(frame, level);
+      var cols = Math.min(img.width, Math.floor(age / BAND_MS * img.width));
+      if (cols <= 0) continue;
+      var v0 = b / BANDS, v1 = (b + 1) / BANDS;
+      var y0 = Math.round(v0 * H), y1 = Math.round(v1 * H);
+      ctx.drawImage(img, 0, v0 * img.height, cols, (v1 - v0) * img.height,
+        0, y0, Math.round(cols / img.width * W), y1 - y0);
+    }
+    setPhotoMask(photo, anyPhoto ? 'linear-gradient(to bottom, ' + stops.join(', ') + ')' : '');
+  }
+
+  function animateReveal(frame) {
+    if (frame._raf) return;
+    var last = performance.now();
+    frame._raf = requestAnimationFrame(function step(now) {
+      // Clamp: a frame's timestamp can predate `last` slightly, and a
+      // background-tab pause shouldn't make it leap ahead.
+      var dt = Math.max(0, Math.min(now - last, 100));
+      last = now;
+      var target = frame._on ? TOTAL : 0;
+      var move = dt * (frame._on ? 1 : OUT_SPEED);
+      frame._p = frame._on ? Math.min(target, frame._p + move) : Math.max(target, frame._p - move);
+      renderReveal(frame);
+      frame._raf = frame._p === target ? 0 : requestAnimationFrame(step);
+    });
+  }
+
+  function setRevealed(frame, on) {
+    var photo = frame.querySelector('.apf-art-photo');
+    if (!photo || frame._on === on) return;
+    frame._on = on;
+    if (frame._p === undefined) frame._p = 0;
+
+    if (reduceMotion.matches) {
+      frame._p = on ? TOTAL : 0;
+      renderReveal(frame);
+      return;
+    }
+    // Photo not downloaded yet: start loading in as soon as it arrives.
+    if (!photo.complete || !photo.naturalWidth) {
+      if (!frame._waiting) {
+        frame._waiting = true;
+        photo.addEventListener('load', function () {
+          frame._waiting = false;
+          if (frame._on) animateReveal(frame);
+        }, { once: true });
+      }
+      return;
+    }
+    animateReveal(frame);
+  }
+
+  // Puts a hidden photo (plus the canvas its pixel passes are drawn in)
+  // over the ASCII inside `frame`, revealed on mouse hover; taps are
+  // handled once for the whole widget, below. If the photo fails to load,
+  // the frame quietly stays ASCII-only.
+  function addRevealPhoto(frame, src, opts) {
+    opts = opts || {};
+    var photo = document.createElement('img');
+    photo.className = 'apf-art-photo';
+    photo.alt = '';                       // the <pre> already labels the picture
+    photo.setAttribute('aria-hidden', 'true');
+    if (opts.lazy !== false) photo.loading = 'lazy';
+    photo.decoding = 'async';
+    photo.draggable = false;
+    if (opts.srcset) { photo.srcset = opts.srcset; photo.sizes = opts.sizes; }
+    photo.src = src;
+    var pix = document.createElement('canvas');
+    pix.className = 'apf-art-pix';
+    pix.setAttribute('aria-hidden', 'true');
+    photo.onerror = function () {
+      frame._on = false;
+      if (frame._raf) cancelAnimationFrame(frame._raf);
+      frame._raf = 0;
+      photo.remove();
+      pix.remove();
+      frame.classList.remove('has-photo', 'is-revealed', 'is-pixelating');
+    };
+    frame.appendChild(photo);
+    frame.appendChild(pix);
+    frame.classList.add('has-photo');
+
+    frame.addEventListener('pointerenter', function (e) {
+      if (e.pointerType === 'mouse') setRevealed(frame, true);
+    });
+    frame.addEventListener('pointerleave', function (e) {
+      if (e.pointerType === 'mouse') setRevealed(frame, false);
+    });
+  }
+
+  // Touch: tap a picture to show the photo, tap it again (or another
+  // picture) to go back to ASCII. Mouse clicks are ignored here, since a
+  // mouse already reveals on hover and a click would leave it stuck on.
+  var lastPointer = '';
+  root.addEventListener('pointerdown', function (e) { lastPointer = e.pointerType; });
+  root.addEventListener('click', function (e) {
+    if (lastPointer === 'mouse') return;
+    var frame = e.target.closest('.apf-art-frame.has-photo');
+    if (!frame) return;
+    var open = !frame._on;
+    root.querySelectorAll('.apf-art-frame.has-photo').forEach(function (f) {
+      if (f !== frame) setRevealed(f, false);
+    });
+    setRevealed(frame, open);
+  });
+
+  // Profile picture: off for now. To give the ASCII avatar the same reveal,
+  // add data-photo="avatar.jpg" (or any image URL) to the .apf-mark div.
+  (function () {
+    var mark = root.querySelector('.apf-mark');
+    var markPre = mark && mark.querySelector('pre');
+    var src = mark && mark.getAttribute('data-photo');
+    if (!markPre || !src) return;
+    var frame = el('div', 'apf-art-frame');
+    markPre.parentNode.insertBefore(frame, markPre);
+    frame.appendChild(markPre);
+    addRevealPhoto(frame, src, { lazy: false });
+  })();
+
   function renderTrack(track, index) {
     var article = el('article', 'apf-post');
     article.style.setProperty('--tint-color', TINTS[index % TINTS.length]);
@@ -1151,7 +1413,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // that many fill the well (older 52-column art and newer 88-column art both fit).
     var artCols = (track.art || '').indexOf('\n');
     if (artCols > 0) artPre.style.setProperty('--art-cols', artCols);
-    well.appendChild(artPre);
+    var frame = el('div', 'apf-art-frame');
+    frame.appendChild(artPre);
+    if (track.coverUrl && track.art) {
+      var opts = {};
+      // Spotify's oEmbed thumbnail is the 300px size; its 640px sibling
+      // differs only in the size code, so offer it to high-DPI screens.
+      if (track.coverUrl.indexOf('ab67616d00001e02') !== -1) {
+        opts.srcset = track.coverUrl + ' 300w, ' +
+          track.coverUrl.replace('ab67616d00001e02', 'ab67616d0000b273') + ' 640w';
+        opts.sizes = '(max-width: 767px) calc(100vw - 66px), 444px';
+      }
+      addRevealPhoto(frame, track.coverUrl, opts);
+    }
+    well.appendChild(frame);
     article.appendChild(well);
 
     var caption = el('p', 'apf-caption');
